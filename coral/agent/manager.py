@@ -48,6 +48,7 @@ from coral.template.coral_md import generate_coral_md
 from coral.types import BUDGET_CLASS_REAL, get_budget_class
 from coral.workspace import (
     ProjectPaths,
+    apply_runtime_mounts,
     create_agent_worktree,
     create_project,
     seed_agent_identity,
@@ -135,6 +136,18 @@ class AgentManager:
             runtime = self.runtime
             self.runtimes[agent_id] = runtime
         return runtime
+
+    def _mounts_base_dir(self) -> Path:
+        """Return the directory used to resolve relative ``runtime_options.mounts`` sources.
+
+        Prefers ``config.task_dir`` (where ``task.yaml`` lives — typically
+        what the user means when they write ``./agent-settings.json`` in
+        their task config), falls back to ``self.config_dir``, then cwd.
+        """
+        for candidate in (self.config.task_dir, self.config_dir):
+            if candidate is not None:
+                return Path(candidate)
+        return Path.cwd()
 
     def start_all(self) -> list[AgentHandle]:
         """Create workspace structure and spawn all agents."""
@@ -402,6 +415,17 @@ class AgentManager:
         gateway_url = self._gateway.url if self._gateway else None
         gateway_api_key = self._gateway_keys.get(agent_id)
 
+        # Per-agent runtime/model/options come from the resolved spec when
+        # available; resume paths that pre-date the specs map fall back to
+        # the top-level defaults. Resolved here (before mounts apply) so
+        # per-agent ``runtime_options.mounts`` can populate the worktree.
+        if spec is not None:
+            model = spec.model
+            runtime_options = spec.runtime_options
+        else:
+            model = self.config.agents.model
+            runtime_options = self.config.agents.runtime_options
+
         # Runtime-specific: write permission settings per worktree
         if shared_dir_name == ".claude":
             setup_claude_settings(
@@ -436,6 +460,13 @@ class AgentManager:
                 gateway_api_key=gateway_api_key,
             )
 
+        # Apply per-agent file mounts last so the user's files win over
+        # CORAL's defaults (e.g. dropping a custom .claude/settings.json
+        # next to CORAL's settings.local.json — Claude Code merges both).
+        mounts = (runtime_options or {}).get("mounts") or {}
+        if mounts:
+            apply_runtime_mounts(worktree_path, mounts, self._mounts_base_dir())
+
         # Seed local heartbeat config from task YAML if not already present
         if not read_agent_heartbeat(self.paths.coral_dir, agent_id):
             write_agent_heartbeat(
@@ -446,8 +477,17 @@ class AgentManager:
         # Write agent ID
         write_agent_id(worktree_path, agent_id)
 
-        # Seed identity certificate (idempotent — preserves evolved certificates on resume)
-        seed_agent_identity(self.paths.coral_dir, agent_id)
+        # Seed the agent's identity certificate (idempotent — preserves the
+        # evolved certificate on resume). When ``runtime_options.identity_file``
+        # is set, the user-provided .md is copied as the gen-0 seed; otherwise
+        # the bundled blank template is rendered.
+        identity_file = (runtime_options or {}).get("identity_file")
+        seed_agent_identity(
+            self.paths.coral_dir,
+            agent_id,
+            source=identity_file,
+            base_dir=self._mounts_base_dir() if identity_file else None,
+        )
 
         # Generate instruction file (CLAUDE.md, AGENTS.md, etc.)
         instruction_file = runtime.instruction_filename
@@ -459,16 +499,6 @@ class AgentManager:
             shared_dir=shared_dir_name,
         )
         (worktree_path / instruction_file).write_text(coral_md)
-
-        # Per-agent runtime/model/options come from the resolved spec when
-        # available; resume paths that pre-date the specs map fall back to
-        # the top-level defaults.
-        if spec is not None:
-            model = spec.model
-            runtime_options = spec.runtime_options
-        else:
-            model = self.config.agents.model
-            runtime_options = self.config.agents.runtime_options
 
         # Start agent
         handle = runtime.start(

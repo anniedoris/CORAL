@@ -37,7 +37,8 @@ def create_agent_worktree(repo_path: Path, agent_id: str, agents_dir: Path) -> P
     # Get current HEAD
     result = subprocess.run(
         ["git", "--git-dir", str(git_dir), "rev-parse", "HEAD"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
 
     if result.returncode == 0:
@@ -45,7 +46,8 @@ def create_agent_worktree(repo_path: Path, agent_id: str, agents_dir: Path) -> P
         logger.debug(f"HEAD={head[:12]}, creating branch {branch_name}")
         result = subprocess.run(
             ["git", "--git-dir", str(git_dir), "branch", branch_name, head],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if result.returncode != 0 and "already exists" not in result.stderr:
             logger.warning(f"Branch creation: {result.stderr.strip()}")
@@ -53,20 +55,32 @@ def create_agent_worktree(repo_path: Path, agent_id: str, agents_dir: Path) -> P
         # No commits yet — create an initial commit
         logger.info("No commits found, creating initial empty commit")
         subprocess.run(
-            ["git", "--git-dir", str(git_dir), "--work-tree", str(repo_path),
-             "commit", "--allow-empty", "-m", "Initial commit"],
-            capture_output=True, text=True,
+            [
+                "git",
+                "--git-dir",
+                str(git_dir),
+                "--work-tree",
+                str(repo_path),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial commit",
+            ],
+            capture_output=True,
+            text=True,
         )
         subprocess.run(
             ["git", "--git-dir", str(git_dir), "branch", branch_name],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
 
     # Create worktree
     logger.info(f"Creating worktree at {worktree_path} on branch {branch_name}")
     result = subprocess.run(
         ["git", "--git-dir", str(git_dir), "worktree", "add", str(worktree_path), branch_name],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -84,7 +98,17 @@ def create_agent_worktree(repo_path: Path, agent_id: str, agents_dir: Path) -> P
 def setup_gitignore(worktree_path: Path) -> None:
     """Write .gitignore to exclude CORAL-managed files from git."""
     gitignore_path = worktree_path / ".gitignore"
-    entries = {".coral_agent_id", ".coral_dir", "CLAUDE.md", "AGENTS.md", ".claude/", ".codex/", ".cursor/", ".opencode/", ".venv/"}
+    entries = {
+        ".coral_agent_id",
+        ".coral_dir",
+        "CLAUDE.md",
+        "AGENTS.md",
+        ".claude/",
+        ".codex/",
+        ".cursor/",
+        ".opencode/",
+        ".venv/",
+    }
 
     # Preserve existing entries
     existing = set()
@@ -120,7 +144,9 @@ def get_coral_dir(worktree_path: Path) -> Path | None:
     return None
 
 
-def setup_shared_state(worktree_path: Path, coral_dir: Path, shared_dir_name: str = ".claude") -> None:
+def setup_shared_state(
+    worktree_path: Path, coral_dir: Path, shared_dir_name: str = ".claude"
+) -> None:
     """Create a shared state directory in the worktree with symlinks to .coral/public/.
 
     Symlinks notes, skills, attempts, and logs from .coral/public/ into
@@ -149,10 +175,10 @@ def setup_shared_state(worktree_path: Path, coral_dir: Path, shared_dir_name: st
         "attempts",
         "logs",
         "heartbeat",
-        # Per-agent identity certificates. Visible to all agents; only the
-        # owner edits their own. Must be a symlink to public so per-agent
-        # writes via .claude/identities/<id>.md land in the shared space
-        # rather than getting siloed in the worktree.
+        # Per-agent identity certificates. Each agent owns and edits its own
+        # identities/<agent_id>.md; everyone reads everyone else's. Must be
+        # a symlink to public/ so per-agent writes via .claude/identities/
+        # land in shared state rather than getting siloed in the worktree.
         "identities",
         # Per-attempt eval artifacts (subprocess logs, terminal recordings,
         # verifier output, etc.) that the grader writes via TaskGrader.eval_logs_dir.
@@ -185,6 +211,74 @@ def setup_shared_state(worktree_path: Path, coral_dir: Path, shared_dir_name: st
                 dst.symlink_to(rel)
             except (ValueError, OSError):
                 dst.symlink_to(src.resolve())
+
+
+def apply_runtime_mounts(
+    worktree_path: Path,
+    mounts: dict[str, str],
+    base_dir: Path,
+) -> None:
+    """Copy host files into the agent worktree per ``runtime_options.mounts``.
+
+    ``mounts`` is a ``{source: dest}`` dict (matching ``docker -v`` source-first
+    convention):
+
+    - **source** is a host path with ``~`` expansion. Resolved relative to
+      ``base_dir`` (typically the task directory) when not absolute.
+    - **dest** is worktree-relative (e.g. ``.claude/settings.json``). Must
+      stay inside the worktree — ``..`` and absolute paths are rejected.
+
+    Files are copied (not symlinked) on every agent setup, so edits to the
+    source propagate at the next agent restart but the worktree owns its own
+    snapshot in between. Parent dirs are created. Existing dest files are
+    overwritten — the call is the last hook before the agent starts, so
+    user-supplied files win over CORAL's defaults (notably, mounting to
+    ``.claude/settings.local.json`` will replace what
+    ``setup_claude_settings`` just wrote).
+
+    For Claude Code settings the recommended dest is ``.claude/settings.json``
+    (no ``.local`` suffix). Claude Code natively merges that with CORAL's
+    ``settings.local.json``, so the user's MCP servers / hooks / env layer
+    on top of CORAL's required worktree-scoped permissions without anyone
+    having to hand-merge JSON.
+
+    Raises:
+        FileNotFoundError: if ``source`` does not resolve to an existing path.
+        ValueError: if ``dest`` escapes ``worktree_path``.
+    """
+    if not mounts:
+        return
+    worktree_resolved = worktree_path.resolve()
+    for source_raw, dest_raw in mounts.items():
+        source = Path(source_raw).expanduser()
+        if not source.is_absolute():
+            source = (base_dir / source).resolve()
+        if not source.exists():
+            raise FileNotFoundError(
+                f"mount source {source_raw!r} (resolved to {source}) does not exist"
+            )
+
+        dest_path = Path(dest_raw)
+        if dest_path.is_absolute():
+            raise ValueError(f"mount dest {dest_raw!r} must be worktree-relative, not absolute")
+        dest = (worktree_resolved / dest_path).resolve()
+        try:
+            dest.relative_to(worktree_resolved)
+        except ValueError as e:
+            raise ValueError(f"mount dest {dest_raw!r} escapes worktree {worktree_path}") from e
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            if dest.exists() or dest.is_symlink():
+                if dest.is_dir() and not dest.is_symlink():
+                    shutil.rmtree(dest)
+                else:
+                    dest.unlink()
+            shutil.copytree(source, dest)
+        else:
+            if dest.is_dir() and not dest.is_symlink():
+                shutil.rmtree(dest)
+            shutil.copy2(source, dest)
 
 
 def setup_claude_settings(
@@ -329,13 +423,9 @@ def setup_opencode_settings(
                 "name": "openai",
                 "options": provider_options,
                 "models": {
-                    "gpt-5.4": {
-                        "name": "gpt-5.4"
-                    },
-                    "claude-opus-4-6": {
-                        "name": "claude-opus-4-6"
-                    }
-                }
+                    "gpt-5.4": {"name": "gpt-5.4"},
+                    "claude-opus-4-6": {"name": "claude-opus-4-6"},
+                },
             },
         }
 
@@ -374,7 +464,7 @@ def setup_codex_settings(
     if gateway_url:
         lines += [
             'model_provider = "litellm"\n',
-            '[model_providers.litellm]',
+            "[model_providers.litellm]",
             'name = "LiteLLM Proxy"',
             f'base_url = "{gateway_url}/v1"',
             'wire_api = "responses"',
@@ -432,9 +522,7 @@ def setup_cursor_settings(
         "---\n"
         "\n"
         "# CORAL Agent Guardrails\n"
-        "\n"
-        + "\n".join(body_lines)
-        + "\n"
+        "\n" + "\n".join(body_lines) + "\n"
     )
 
     (rules_dir / "coral.mdc").write_text(rules_md)
@@ -466,10 +554,7 @@ def setup_worktree_env(worktree_path: Path, setup_commands: list[str]) -> None:
     worktree_venv = worktree_path / ".venv"
     venv_python = worktree_venv / "bin" / "python"
     if venv_python.exists():
-        logger.debug(
-            f"Worktree venv already populated at {worktree_venv}, "
-            f"skipping setup commands"
-        )
+        logger.debug(f"Worktree venv already populated at {worktree_venv}, skipping setup commands")
         return
 
     env_override = {"UV_PROJECT_ENVIRONMENT": str(worktree_venv)}
@@ -492,6 +577,4 @@ def setup_worktree_env(worktree_path: Path, setup_commands: list[str]) -> None:
                 env=env,
             )
             if result.returncode != 0:
-                logger.warning(
-                    f"Failed to install coral in worktree: {result.stderr.strip()}"
-                )
+                logger.warning(f"Failed to install coral in worktree: {result.stderr.strip()}")

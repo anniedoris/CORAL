@@ -50,14 +50,18 @@ def _setup_repo_with_config(base_dir: Path) -> Path:
     repo = base_dir / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", str(repo)], capture_output=True, check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@test.com"], capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@test.com"], capture_output=True
+    )
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], capture_output=True)
 
     # Create a file and .gitignore, then make an initial commit
     (repo / "hello.py").write_text("print('hello')\n")
     (repo / ".gitignore").write_text(".coral/\n.coral_dir\n.claude/\n.coral_agent_id\nCLAUDE.md\n")
     subprocess.run(["git", "-C", str(repo), "add", "hello.py", ".gitignore"], capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", "Initial"], capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "Initial"], capture_output=True, check=True
+    )
 
     # Set up .coral directory with config + eval/grader.py
     coral_dir = repo / ".coral"
@@ -197,7 +201,9 @@ def _set_grader_config(repo: Path, **fields) -> None:
 def _head_hash(repo: Path) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
 
@@ -212,7 +218,10 @@ def test_submit_eval_rejects_when_agent_at_pending_limit():
         try:
             (repo / "hello.py").write_text("print('v1')\n")
             first = submit_eval(
-                message="v1", agent_id="agent-test", workdir=str(repo), wait=False,
+                message="v1",
+                agent_id="agent-test",
+                workdir=str(repo),
+                wait=False,
             )
             assert first.status == "pending"
             head_after_first = _head_hash(repo)
@@ -221,7 +230,10 @@ def test_submit_eval_rejects_when_agent_at_pending_limit():
             (repo / "hello.py").write_text("print('v2')\n")
             with pytest.raises(RuntimeError, match=r"pending attempt"):
                 submit_eval(
-                    message="v2", agent_id="agent-test", workdir=str(repo), wait=False,
+                    message="v2",
+                    agent_id="agent-test",
+                    workdir=str(repo),
+                    wait=False,
                 )
 
             # No orphan commit was created by the rejected submit.
@@ -243,7 +255,10 @@ def test_submit_eval_allows_after_drain():
 
             (repo / "hello.py").write_text("print('v2')\n")
             second = submit_eval(
-                message="v2", agent_id="agent-test", workdir=str(repo), wait=False,
+                message="v2",
+                agent_id="agent-test",
+                workdir=str(repo),
+                wait=False,
             )
             assert second.status == "pending"
         finally:
@@ -263,15 +278,19 @@ def test_submit_eval_respects_higher_limit():
             for i in range(3):
                 (repo / "hello.py").write_text(f"print('v{i}')\n")
                 submit_eval(
-                    message=f"v{i}", agent_id="agent-test",
-                    workdir=str(repo), wait=False,
+                    message=f"v{i}",
+                    agent_id="agent-test",
+                    workdir=str(repo),
+                    wait=False,
                 )
 
             (repo / "hello.py").write_text("print('overflow')\n")
             with pytest.raises(RuntimeError, match=r"pending attempt"):
                 submit_eval(
-                    message="overflow", agent_id="agent-test",
-                    workdir=str(repo), wait=False,
+                    message="overflow",
+                    agent_id="agent-test",
+                    workdir=str(repo),
+                    wait=False,
                 )
         finally:
             sys.path.pop(0)
@@ -290,8 +309,10 @@ def test_submit_eval_unlimited_when_zero():
             for i in range(5):
                 (repo / "hello.py").write_text(f"print('v{i}')\n")
                 submit_eval(
-                    message=f"v{i}", agent_id="agent-test",
-                    workdir=str(repo), wait=False,
+                    message=f"v{i}",
+                    agent_id="agent-test",
+                    workdir=str(repo),
+                    wait=False,
                 )
             # All five sit in the queue as pending; nothing was rejected.
             attempts_dir = repo / ".coral" / "public" / "attempts"
@@ -314,7 +335,10 @@ def test_submit_eval_per_agent_isolation():
             # agent-A is at its limit, but agent-B has no pending attempts.
             (repo / "hello.py").write_text("print('b')\n")
             second = submit_eval(
-                message="b", agent_id="agent-B", workdir=str(repo), wait=False,
+                message="b",
+                agent_id="agent-B",
+                workdir=str(repo),
+                wait=False,
             )
             assert second.status == "pending"
             assert second.agent_id == "agent-B"

@@ -10,9 +10,12 @@ import pytest
 
 from coral.config import AgentConfig, CoralConfig, GraderConfig, TaskConfig, WorkspaceConfig
 from coral.workspace import (
+    apply_runtime_mounts,
     create_project,
+    seed_agent_identity,
     setup_codex_settings,
     setup_gitignore,
+    setup_shared_state,
     setup_worktree_env,
     write_agent_id,
 )
@@ -34,9 +37,21 @@ def _git_init(d: str) -> None:
     """Initialise a git repo with a dummy commit (works without global config)."""
     subprocess.run(["git", "init", d], capture_output=True, check=True)
     subprocess.run(
-        ["git", "-C", d, "-c", "user.name=test", "-c", "user.email=test@test.com",
-         "commit", "--allow-empty", "-m", "init"],
-        capture_output=True, check=True,
+        [
+            "git",
+            "-C",
+            d,
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        capture_output=True,
+        check=True,
     )
 
 
@@ -75,6 +90,7 @@ def test_create_project_unique_runs():
         paths1 = create_project(config)
 
         import time
+
         time.sleep(1.1)  # ensure different timestamp
 
         paths2 = create_project(config)
@@ -139,7 +155,8 @@ def test_setup_gitignore_idempotent():
     ],
 )
 def test_setup_codex_settings_writes_top_level_web_search(
-    research: bool, expected: str,
+    research: bool,
+    expected: str,
 ):
     """Codex expects web_search as a top-level mode, not under [tools]."""
     with tempfile.TemporaryDirectory() as d:
@@ -185,10 +202,13 @@ def test_create_project_setup_runs_sequentially():
         worktree = Path(d) / "worktree"
         worktree.mkdir()
 
-        setup_worktree_env(worktree, [
-            "mkdir -p mydir",
-            "echo done > mydir/result.txt",
-        ])
+        setup_worktree_env(
+            worktree,
+            [
+                "mkdir -p mydir",
+                "echo done > mydir/result.txt",
+            ],
+        )
 
         result_file = worktree / "mydir" / "result.txt"
         assert result_file.exists()
@@ -228,3 +248,333 @@ def test_setup_worktree_env_runs_when_venv_missing():
 
         assert marker.exists(), "Setup should have run on first launch"
 
+
+# --- apply_runtime_mounts tests ---
+
+
+def _mount_workspace(d: Path) -> tuple[Path, Path]:
+    """Create a worktree dir and a base_dir under d; return both."""
+    worktree = d / "worktree"
+    worktree.mkdir()
+    base = d / "base"
+    base.mkdir()
+    return worktree, base
+
+
+def test_apply_runtime_mounts_no_mounts_is_noop():
+    """Empty/missing mounts must not error or touch the worktree."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        before = sorted(worktree.iterdir())
+        apply_runtime_mounts(worktree, {}, base)
+        apply_runtime_mounts(worktree, None, base)  # type: ignore[arg-type]
+        assert sorted(worktree.iterdir()) == before
+
+
+def test_apply_runtime_mounts_copies_file_with_relative_source():
+    """Relative source resolves against base_dir; dest is worktree-relative."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        (base / "settings.json").write_text('{"foo": 1}')
+
+        apply_runtime_mounts(
+            worktree,
+            {"settings.json": ".claude/settings.json"},
+            base,
+        )
+
+        dest = worktree / ".claude" / "settings.json"
+        assert dest.exists()
+        assert dest.read_text() == '{"foo": 1}'
+
+
+def test_apply_runtime_mounts_absolute_source():
+    """Absolute source is used as-is (base_dir ignored)."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        elsewhere = Path(d) / "elsewhere"
+        elsewhere.mkdir()
+        src = elsewhere / "src.json"
+        src.write_text("absolute")
+
+        apply_runtime_mounts(worktree, {str(src): ".claude/settings.json"}, base)
+
+        assert (worktree / ".claude" / "settings.json").read_text() == "absolute"
+
+
+def test_apply_runtime_mounts_expands_tilde(monkeypatch):
+    """``~`` in source expands to $HOME."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        fake_home = Path(d) / "fake_home"
+        fake_home.mkdir()
+        (fake_home / "settings.json").write_text("from-home")
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        apply_runtime_mounts(
+            worktree,
+            {"~/settings.json": ".claude/settings.json"},
+            base,
+        )
+
+        assert (worktree / ".claude" / "settings.json").read_text() == "from-home"
+
+
+def test_apply_runtime_mounts_copies_directory():
+    """Directory sources copy recursively."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        srcdir = base / "mcp"
+        srcdir.mkdir()
+        (srcdir / "db.json").write_text("db config")
+        (srcdir / "fs.json").write_text("fs config")
+
+        apply_runtime_mounts(worktree, {"mcp": ".claude/mcp"}, base)
+
+        dest = worktree / ".claude" / "mcp"
+        assert (dest / "db.json").read_text() == "db config"
+        assert (dest / "fs.json").read_text() == "fs config"
+
+
+def test_apply_runtime_mounts_overwrites_existing_file():
+    """Existing dest is overwritten — second invocation refreshes."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        src = base / "settings.json"
+        src.write_text("v1")
+
+        apply_runtime_mounts(worktree, {"settings.json": ".claude/settings.json"}, base)
+        src.write_text("v2")
+        apply_runtime_mounts(worktree, {"settings.json": ".claude/settings.json"}, base)
+
+        assert (worktree / ".claude" / "settings.json").read_text() == "v2"
+
+
+def test_apply_runtime_mounts_overwrites_corals_settings_local_json():
+    """User can replace CORAL's settings.local.json (mounts run last, user wins)."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        # Simulate CORAL having already written settings.local.json
+        (worktree / ".claude").mkdir()
+        (worktree / ".claude" / "settings.local.json").write_text('{"coral": true}')
+
+        (base / "user-settings.json").write_text('{"user": true}')
+
+        apply_runtime_mounts(
+            worktree,
+            {"user-settings.json": ".claude/settings.local.json"},
+            base,
+        )
+
+        assert (worktree / ".claude" / "settings.local.json").read_text() == '{"user": true}'
+
+
+def test_apply_runtime_mounts_missing_source_raises():
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        with pytest.raises(FileNotFoundError, match="mount source"):
+            apply_runtime_mounts(worktree, {"nope.json": ".claude/x.json"}, base)
+
+
+def test_apply_runtime_mounts_absolute_dest_rejected():
+    """Dest must be worktree-relative — absolute paths are rejected."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        (base / "src").write_text("x")
+        with pytest.raises(ValueError, match="must be worktree-relative"):
+            apply_runtime_mounts(worktree, {"src": "/etc/passwd"}, base)
+
+
+def test_apply_runtime_mounts_dest_escape_rejected():
+    """Dest cannot escape the worktree via ``..``."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        (base / "src").write_text("x")
+        with pytest.raises(ValueError, match="escapes worktree"):
+            apply_runtime_mounts(worktree, {"src": "../escape.txt"}, base)
+
+
+def test_apply_runtime_mounts_creates_parent_dirs():
+    """Nested dest paths get their parent directories created."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        (base / "src.json").write_text("nested")
+
+        apply_runtime_mounts(
+            worktree,
+            {"src.json": "deeply/nested/dir/file.json"},
+            base,
+        )
+
+        assert (worktree / "deeply" / "nested" / "dir" / "file.json").read_text() == "nested"
+
+
+def test_apply_runtime_mounts_multiple_files():
+    """All entries in the mounts dict get copied."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree, base = _mount_workspace(Path(d))
+        (base / "a.json").write_text("A")
+        (base / "b.json").write_text("B")
+
+        apply_runtime_mounts(
+            worktree,
+            {
+                "a.json": ".claude/a.json",
+                "b.json": ".claude/b.json",
+            },
+            base,
+        )
+
+        assert (worktree / ".claude" / "a.json").read_text() == "A"
+        assert (worktree / ".claude" / "b.json").read_text() == "B"
+
+
+# --- seed_agent_identity tests ---
+
+
+def _identity_workspace(d: Path) -> tuple[Path, Path]:
+    """Create a coral_dir + base_dir under d; return both."""
+    coral_dir = d / ".coral"
+    coral_dir.mkdir()
+    base = d / "base"
+    base.mkdir()
+    return coral_dir, base
+
+
+def test_seed_agent_identity_copies_file():
+    """A user-provided .md is copied to public/identities/<agent_id>.md."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, base = _identity_workspace(Path(d))
+        (base / "integrator.md").write_text("# Integrator identity\n")
+
+        dst = seed_agent_identity(coral_dir, "agent-1", "integrator.md", base)
+
+        assert dst == coral_dir / "public" / "identities" / "agent-1.md"
+        assert dst.read_text() == "# Integrator identity\n"
+
+
+def test_seed_agent_identity_idempotent_preserves_existing():
+    """Existing identity is never overwritten — agent evolution is preserved."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, base = _identity_workspace(Path(d))
+        (base / "seed.md").write_text("# seed")
+
+        # First seed
+        seed_agent_identity(coral_dir, "agent-1", "seed.md", base)
+        # Simulate the agent evolving its own identity
+        evolved = coral_dir / "public" / "identities" / "agent-1.md"
+        evolved.write_text("# evolved gen 3")
+
+        # Re-seed (e.g. on resume) must not clobber
+        seed_agent_identity(coral_dir, "agent-1", "seed.md", base)
+
+        assert evolved.read_text() == "# evolved gen 3"
+
+
+def test_seed_agent_identity_absolute_source():
+    """Absolute source paths are used as-is."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, base = _identity_workspace(Path(d))
+        elsewhere = Path(d) / "elsewhere"
+        elsewhere.mkdir()
+        src = elsewhere / "skeptic.md"
+        src.write_text("# skeptic")
+
+        seed_agent_identity(coral_dir, "agent-2", str(src), base)
+
+        assert (coral_dir / "public" / "identities" / "agent-2.md").read_text() == "# skeptic"
+
+
+def test_seed_agent_identity_expands_tilde(monkeypatch):
+    """``~`` in source expands to $HOME, matching apply_runtime_mounts."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, base = _identity_workspace(Path(d))
+        fake_home = Path(d) / "fake_home"
+        fake_home.mkdir()
+        (fake_home / "id.md").write_text("from-home")
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        seed_agent_identity(coral_dir, "agent-1", "~/id.md", base)
+
+        assert (coral_dir / "public" / "identities" / "agent-1.md").read_text() == "from-home"
+
+
+def test_seed_agent_identity_missing_source_raises():
+    """A missing source surfaces as FileNotFoundError so misconfig fails loudly."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, base = _identity_workspace(Path(d))
+        with pytest.raises(FileNotFoundError, match="identity_file"):
+            seed_agent_identity(coral_dir, "agent-1", "nope.md", base)
+
+
+def test_seed_agent_identity_per_agent_distinct_content():
+    """Multiple agents can each be seeded from a different file."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, base = _identity_workspace(Path(d))
+        (base / "a.md").write_text("A's identity")
+        (base / "b.md").write_text("B's identity")
+
+        seed_agent_identity(coral_dir, "agent-1", "a.md", base)
+        seed_agent_identity(coral_dir, "agent-2", "b.md", base)
+
+        ids = coral_dir / "public" / "identities"
+        assert (ids / "agent-1.md").read_text() == "A's identity"
+        assert (ids / "agent-2.md").read_text() == "B's identity"
+
+
+def test_seed_agent_identity_default_template_when_no_source():
+    """source=None falls back to the bundled gen-0 identity template."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, _ = _identity_workspace(Path(d))
+
+        dst = seed_agent_identity(coral_dir, "agent-1")
+
+        assert dst.exists()
+        body = dst.read_text()
+        # Bundled template renders the agent_id and frontmatter
+        assert "agent_id: agent-1" in body
+        assert "generation: 0" in body
+
+
+def test_seed_agent_identity_relative_source_without_base_dir_raises():
+    """A relative source with no base_dir surfaces as ValueError, not silent cwd resolution."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir, _ = _identity_workspace(Path(d))
+        with pytest.raises(ValueError, match="base_dir is required"):
+            seed_agent_identity(coral_dir, "agent-1", "relative.md")
+
+
+# --- setup_shared_state identity-symlink tests ---
+
+
+def test_setup_shared_state_symlinks_identities():
+    """identities/ is symlinked into the worktree's shared dir."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir = Path(d) / ".coral"
+        (coral_dir / "public" / "identities").mkdir(parents=True)
+        worktree = Path(d) / "worktree"
+        worktree.mkdir()
+
+        setup_shared_state(worktree, coral_dir, ".claude")
+
+        link = worktree / ".claude" / "identities"
+        assert link.is_symlink()
+        assert link.resolve() == (coral_dir / "public" / "identities").resolve()
+
+
+def test_setup_shared_state_migrates_real_identities_dir():
+    """A previous run's real identities/ dir is migrated into shared, then symlinked."""
+    with tempfile.TemporaryDirectory() as d:
+        coral_dir = Path(d) / ".coral"
+        (coral_dir / "public" / "identities").mkdir(parents=True)
+        worktree = Path(d) / "worktree"
+        (worktree / ".claude" / "identities").mkdir(parents=True)
+        # An agent wrote its identity into a real local dir before the symlink
+        # behavior shipped — make sure we don't lose that file.
+        (worktree / ".claude" / "identities" / "agent-1.md").write_text("local content")
+
+        setup_shared_state(worktree, coral_dir, ".claude")
+
+        link = worktree / ".claude" / "identities"
+        assert link.is_symlink()
+        assert (coral_dir / "public" / "identities" / "agent-1.md").read_text() == "local content"
