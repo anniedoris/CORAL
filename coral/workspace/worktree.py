@@ -371,10 +371,15 @@ def setup_claude_settings(
 ) -> None:
     """Write Claude Code settings.json with permissions and gateway env.
 
-    Grants the agent all tool permissions via allow rules (replacing
-    --dangerously-skip-permissions).  When a gateway is configured, sets
-    ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY in the settings ``env`` so
-    they override the user's global ``~/.claude/settings.json``.
+    Scopes the agent's tools via allow/deny rules (replacing
+    --dangerously-skip-permissions).  The permission *mode* is deliberately NOT
+    set here: a project-level ``defaultMode: "auto"`` is silently downgraded to
+    ``default`` in headless ``-p`` mode (only ~/.claude/settings.json or the
+    ``--permission-mode`` CLI flag may escalate to auto), so the runtime sets it
+    via ``--permission-mode auto`` on the command line instead. The allow/deny
+    rules below do take effect and are the real scoping mechanism.  When a
+    gateway is configured, sets ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY in the
+    settings ``env`` so they override the user's global ``~/.claude/settings.json``.
 
     In multi-island runs (``island_id`` set), Read scopes only to the
     agent's own island root (``.coral/islands/<id>/``) — sibling islands
@@ -426,8 +431,11 @@ def setup_claude_settings(
     if not research:
         deny_rules.extend(["WebSearch", "WebFetch"])
 
+    # No ``defaultMode`` here: a project-level ``auto`` is silently downgraded
+    # to ``default`` in headless ``-p`` mode, so it would be a misleading no-op.
+    # The mode is set authoritatively via ``--permission-mode auto`` on the
+    # ``claude`` CLI (see coral/agent/builtin/claude_code.py).
     permissions: dict = {
-        "defaultMode": "auto",
         "allow": allow_rules,
         "deny": deny_rules,
     }
