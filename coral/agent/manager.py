@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from coral.agent.heartbeat import HeartbeatRunner
 from coral.agent.migration import (
     IslandRoster,
     MigrationCandidate,
+    MigrationResyncOp,
     MigrationRunner,
     choose_roster_balanced_subset,
 )
@@ -49,6 +51,7 @@ from coral.config import CoralConfig
 from coral.hub._island import island_root
 from coral.hub.attempts import (
     agent_in_grader_queue,
+    archive_attempts,
     get_leaderboard,
     read_attempts,
     read_eval_count,
@@ -290,7 +293,8 @@ class AgentManager:
         still recorded in .coral/public/grader_daemon.pid — otherwise two
         daemons would race for the same pending attempts.
         """
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
 
         if self._grader_proc is not None and self._grader_proc.is_alive():
             return
@@ -370,7 +374,8 @@ class AgentManager:
 
     def _start_gateway_if_enabled(self) -> None:
         """Start the LiteLLM gateway if configured."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         gw_cfg = self.config.agents.gateway
         if not gw_cfg.enabled:
             return
@@ -441,7 +446,8 @@ class AgentManager:
         a migration the live ``_agent_island`` map is fresher than the birth
         island recorded on the spec.
         """
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
 
         def island_of(aid: str) -> str | None:
             spec = self.specs_by_id.get(aid)
@@ -461,7 +467,8 @@ class AgentManager:
         """
         if self._sandbox is None:
             return None
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
 
         from coral.sandbox import AgentSandboxContext
 
@@ -484,7 +491,8 @@ class AgentManager:
         agent_ids: list[str],
     ) -> dict[str, str]:
         """Run the warm-start research phase. Returns {agent_id: session_id}."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
 
         if self.verbose:
             print("\n[coral] Warm-start: research phase...\n")
@@ -532,7 +540,8 @@ class AgentManager:
         max_turns: int | None = None,
     ) -> AgentHandle:
         """Set up a single agent and start it."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
 
         runtime = self._runtime_for(agent_id)
         spec = self.specs_by_id.get(agent_id)
@@ -788,8 +797,15 @@ class AgentManager:
         idx: int,
         prompt: str,
         prompt_source: str | None = None,
+        pre_restart_ops: Sequence[Callable[[str], None]] = (),
     ) -> AgentHandle:
-        """Interrupt a running agent and resume with a feedback prompt."""
+        """Interrupt a running agent and resume with a feedback prompt.
+
+        ``pre_restart_ops`` run (with the agent id) in the quiet window
+        after the interrupt and before the restart — the slot for surgery
+        that needs the agent's process down, e.g. migration resync ops
+        rewriting launch-injected state.
+        """
         handle = self.handles[idx]
         agent_id = handle.agent_id
 
@@ -798,6 +814,8 @@ class AgentManager:
         # via the owning runtime after interrupt() returns.
         handle.interrupt()
         session_id = self._runtime_for(agent_id).extract_session_id(handle.log_path)
+        for op in pre_restart_ops:
+            op(agent_id)
         self._restart_counts[agent_id] = self._restart_counts.get(agent_id, 0) + 1
 
         if session_id:
@@ -901,6 +919,28 @@ class AgentManager:
             if action.id:
                 applied_actions.add(action.id)
 
+        # Reset matched worktrees before any agent starts, archiving the
+        # attempts on the discarded segments first (soft delete: the run has
+        # explicitly rewound past them, so leaderboard/status/log must stop
+        # showing them). The JSONs and git objects stay on disk.
+        for agent_dir in agent_dirs:
+            action = steering_by_agent.get(agent_dir.name)
+            if action is None:
+                continue
+            discarded = _discarded_commit_hashes(agent_dir, action.hash)
+            _reset_worktree_to_commit(agent_dir, action.hash)
+            if discarded:
+                archived = archive_attempts(
+                    paths.coral_dir,
+                    discarded,
+                    reason=f"discarded by resume --from {action.hash}",
+                )
+                if archived:
+                    logger.info(
+                        f"Archived {len(archived)} attempt(s) discarded by "
+                        f"resume --from {action.hash} ({agent_dir.name})"
+                    )
+
         handles = []
         for agent_dir in agent_dirs:
             agent_id = agent_dir.name
@@ -938,7 +978,6 @@ class AgentManager:
                 prompt = fresh_start_prompt
 
             if steering_action is not None:
-                _reset_worktree_to_commit(agent_dir, steering_action.hash)
                 prompt = _compose_resume_instruction(
                     base_prompt=prompt,
                     action=steering_action,
@@ -1062,7 +1101,8 @@ class AgentManager:
 
     def _get_seen_attempts(self) -> set[str]:
         """Get the set of attempt filenames currently in any island's attempts dir."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         coral_dir = self.paths.coral_dir
         islands_dir = coral_dir / "islands"
         if islands_dir.exists():
@@ -1079,7 +1119,8 @@ class AgentManager:
 
     def _resolve_attempt_path(self, fname: str) -> Path | None:
         """Look up an attempt JSON file across all islands or public/."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         coral_dir = self.paths.coral_dir
         islands_dir = coral_dir / "islands"
         if islands_dir.exists():
@@ -1160,7 +1201,8 @@ class AgentManager:
 
     def _get_eval_count(self) -> int:
         """Read the current global eval count."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         coral_dir = self.paths.coral_dir
         if (coral_dir / "islands").exists():
             counter_file = coral_dir / "eval_count"
@@ -1184,7 +1226,8 @@ class AgentManager:
 
     def _read_all_run_attempts(self) -> list[Attempt]:
         """Read attempts across the whole run, spanning islands when present."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         coral_dir = self.paths.coral_dir
         if (coral_dir / "islands").exists():
             attempts = []
@@ -1285,7 +1328,8 @@ class AgentManager:
         real_attempt_count = self._get_finalized_real_attempt_count()
         threshold = stop_config.score_threshold
         if threshold is not None:
-            assert self.paths is not None
+            if self.paths is None:
+                raise RuntimeError("run paths are not initialized; start_all() has not run")
             best = get_leaderboard(
                 self.paths.coral_dir,
                 top_n=1,
@@ -1329,7 +1373,8 @@ class AgentManager:
 
     def _auto_stop(self, reason: dict[str, Any]) -> None:
         """Record the auto-stop reason and gracefully stop the run."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         write_auto_stop(self.paths.coral_dir, reason)
         logger.info(
             "Auto-stop triggered: %s (score=%s, real_attempts=%s)",
@@ -1350,7 +1395,8 @@ class AgentManager:
         """Build a HeartbeatRunner by merging local + global heartbeat configs."""
         from coral.agent.heartbeat import HeartbeatAction
 
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         shared_dir = self._runtime_for(agent_id).shared_dir_name
         island_id = self._agent_island.get(agent_id)
 
@@ -1517,7 +1563,8 @@ class AgentManager:
         linger. Returns the ISO-8601 timestamp of the dump on success, or
         None if the dump could not be written.
         """
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         diag_dir = self.paths.coral_dir / "public" / "diagnostics" / agent_id
         try:
             diag_dir.mkdir(parents=True, exist_ok=True)
@@ -1732,7 +1779,8 @@ class AgentManager:
         correct after a resume reshuffles agents across islands via the
         ``.coral_island`` breadcrumb.
         """
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
         results: dict[str, float] = {}
         direction = self.config.grader.direction
         islands_dir = self.paths.coral_dir / "islands"
@@ -1858,21 +1906,82 @@ class AgentManager:
                 )
             return False
 
+        applied: list[MigrationCandidate] = []
+        ok = True
         for candidate in migrations:
             try:
                 self._apply_migration(candidate, assume_preflight=True)
+                applied.append(candidate)
             except Exception as e:
                 logger.exception(
                     f"Migration {candidate.agent_id} {candidate.src_island}→"
                     f"{candidate.dst_island} failed: {e}"
                 )
-                return False
-        self._deferred_candidates = []
-        return True
+                ok = False
+                break
+        # Even a partially-applied batch changed the partition — resync
+        # bystanders for whatever actually moved.
+        self._resync_bystanders_after_migration(applied)
+        if ok:
+            self._deferred_candidates = []
+        return ok
+
+    def _migration_resync_ops(self) -> list[MigrationResyncOp]:
+        """Registry of resync ops for the standard bystander-resync phase.
+
+        Each op names a piece of launch-injected per-agent state that can
+        only follow an island-partition change through a restart; an op
+        contributes a ``prepare`` hook only for work the restart pipeline
+        (``_setup_and_start_agent``) does not already cover. No applicable
+        ops → the phase is a no-op.
+        """
+        ops: list[MigrationResyncOp] = []
+        if self._sandbox is not None:
+            # Sandbox read boundaries are baked into per-agent settings at
+            # launch; the restart regenerates them via prepare_agent, so no
+            # prepare hook is needed.
+            ops.append(MigrationResyncOp(name="sandbox"))
+        return ops
+
+    def _resync_bystanders_after_migration(self, applied: list[MigrationCandidate]) -> None:
+        """Standard post-migration phase: restart live bystanders on the
+        affected islands so launch-injected per-agent state follows the new
+        partition.
+
+        What needs resyncing is defined by :meth:`_migration_resync_ops` —
+        with no applicable ops (e.g. sandboxing disabled) this is a no-op.
+        Migrants are excluded (:meth:`_apply_migration` already restarted
+        them with fresh state); dead and paused agents pick everything up
+        on their own (re)start path. Sessions are resumed, so no work is
+        lost. Disable via ``islands.migration.resync_bystanders``.
+        """
+        ops = self._migration_resync_ops()
+        if not applied or not ops or not self.migration_config.resync_bystanders:
+            return
+        affected = {c.src_island for c in applied} | {c.dst_island for c in applied}
+        migrated = {c.agent_id for c in applied}
+        op_names = ", ".join(op.name for op in ops)
+        pre_restart_ops = [op.prepare for op in ops if op.prepare is not None]
+        for idx, handle in enumerate(self.handles):
+            agent_id = handle.agent_id
+            if agent_id in migrated or not handle.alive or self._is_paused(agent_id):
+                continue
+            if self._agent_island.get(agent_id) in affected:
+                logger.info(
+                    f"Migration resync ({op_names}): restarting {agent_id} "
+                    f"(island partition changed)"
+                )
+                self.handles[idx] = self._interrupt_and_resume(
+                    idx,
+                    prompt=_build_resync_prompt(op_names),
+                    prompt_source="migration:resync",
+                    pre_restart_ops=pre_restart_ops,
+                )
 
     def _migration_block_reason(self, candidate: MigrationCandidate) -> str | None:
         """Return why ``candidate`` cannot safely migrate right now, if any."""
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
 
         agent_id = candidate.agent_id
         if not any(handle.agent_id == agent_id for handle in self.handles):
@@ -2028,7 +2137,8 @@ class AgentManager:
         8. Hand back to ``_setup_and_start_agent`` with the new island and
            an "arrival" prompt summarising the move.
         """
-        assert self.paths is not None
+        if self.paths is None:
+            raise RuntimeError("run paths are not initialized; start_all() has not run")
 
         agent_id = candidate.agent_id
         # (1) Locate handle, bail on missing / paused / pending agents.
@@ -2860,6 +2970,19 @@ def _reset_worktree_to_commit(worktree_path: Path, target_hash: str) -> None:
         raise RuntimeError(f"Steering checkout failed for '{target_hash}': {result.stderr}")
 
 
+def _discarded_commit_hashes(worktree_path: Path, target_hash: str) -> set[str]:
+    """Commits that a reset to target_hash drops from this worktree's HEAD."""
+    result = subprocess.run(
+        ["git", "rev-list", f"{target_hash}..HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=worktree_path,
+    )
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def _worktree_head_descends_from(worktree_path: Path, target_hash: str) -> bool:
     """Return True when the worktree HEAD has target_hash as an ancestor."""
     result = subprocess.run(
@@ -2919,4 +3042,14 @@ def _build_migration_prompt(candidate: MigrationCandidate, *, shared_dir: str) -
         f"here so you don't reinvent it.\n\n"
         f"Then bring your strongest ideas from your previous run and "
         f"adapt them to this island's frontier."
+    )
+
+
+def _build_resync_prompt(op_names: str) -> str:
+    """Prompt for bystanders restarted by the post-migration resync phase."""
+    return (
+        "An agent migrated between islands, so your process was restarted "
+        f"to refresh launch-injected state ({op_names}) against the new "
+        "island roster. Your session and work are intact — continue exactly "
+        "where you left off."
     )
