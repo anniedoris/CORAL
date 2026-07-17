@@ -1,0 +1,77 @@
+task:
+  name: "Drawing to CAD Toolkit"
+  description: |
+    Engineering drawing -> CAD. A fixed CAD-writing consumer (a Claude model)
+    is given an engineering-drawing image and must produce CadQuery code whose
+    solid matches the ground-truth part. Your job is NOT to write CAD — it is to
+    build a perception tool that makes the consumer's output more accurate.
+
+    You edit ONE function in `solution.py`:
+
+        drawing_processor(drawing_path: str, workdir: str) -> DrawingHints
+
+    It receives the path to a drawing image and a scratch directory, and returns
+    hints that are injected into the consumer:
+      - DrawingHints.text   (1D): strings appended to the consumer's prompt
+      - DrawingHints.images (2D): paths to images you write under `workdir`,
+                                  attached to the consumer as image inputs
+
+    Do NOT edit the DrawingHints class or the drawing_processor signature — the
+    grader depends on them. Add any helper functions/imports you need.
+
+    Score = Aligned IoU between the consumer's generated solid and the ground
+    truth, with the median taken over the test set (invalid solids score 0). The empty
+    baseline (no hints) is the reference; improve on it.
+  tips: |
+    - A public dev set of 10 drawings (+ their ground-truth STLs) is in `dev/` — develop
+      against it. The scored test set is separate and hidden from you.
+    - Run `python dev_inspect.py` to execute your drawing_processor on the dev drawings and
+      see the hints it produces (text printed; images written to `inspect_out/`). You can use this to check validity and inspect your hints before submitting.
+    - The consumer and drawings are fixed; only the hints your code outputs change between evals.
+    - drawing_processor runs in the grader environment. Available libraries:
+      opencv-python-headless scikit-image shapely pillow numpy scipy easyocr. You cannot install
+      new packages for the grader — build within these.
+    - Write derived images into `workdir` and return their paths; paths outside
+      `workdir` are ignored.
+    - **Text hints (1D):** OCR, dimension/tolerance parsing, GD&T parsing, view labeling, and view descriptions.
+    - **Image hints (2D):** View/feature segmentation, multi-view correspondence, edge maps, and dimension-to-geometry association.
+
+preset: local-claude
+
+grader:
+  entrypoint: "drawing2cad_grader.grader:Grader"
+  private: ["taskdata"]           # hides the ground-truth STLs from agents
+  direction: maximize
+  timeout: 3600
+  setup:
+    - "uv pip install -e ./grader"
+    # drawing_processor toolkit (must match the libraries listed in tips):
+    - "uv pip install opencv-python-headless scikit-image shapely pillow numpy scipy easyocr"
+    # Scoring deps (CADBench) get added here when scoring.py is wired in.
+    - "uv pip install pymeshlab tabulate trimesh torch cadquery open3d datasets pebble manifold3d"
+  args:
+    program_file: "solution.py"
+    # --- test set / signal ---
+    eval_subset: 20               # fixed subset scored each eval (null = all 100)
+    # --- consumer (modular) ---
+    consumer: "openai_api"        # openai_api | echo | claude_code
+    # openai_api consumer:
+    model: "claude-opus-4-7"
+    api_endpoint: "https://api.anthropic.com/v1/"
+    api_key_env: "DRAWING2CAD_CONSUMER_API_KEY"
+    # temperature: 0.1            # optional sampling controls
+    # max_tokens: 4096
+    # claude_code consumer (agentic; uses the `claude` CLI's auth, not the key above):
+    cc_model: "opus"              # CLI alias, not an API model id
+    cc_max_turns: 30
+    cc_timeout: 300               # per-sample claude session timeout (s)
+    variable_name: "result"
+    eval_num_workers: 16
+    processor_timeout: 60         # per-sample drawing_processor timeout (s)
+    code_exec_timeout: 60         # per-sample CadQuery execution timeout (s)
+
+workspace:
+  repo_path: "./seed"
+  setup:
+    # Same toolkit in the agent worktree so agents can develop/test locally.
+    - "uv pip install opencv-python-headless scikit-image shapely pillow numpy scipy easyocr"
